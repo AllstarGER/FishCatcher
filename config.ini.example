@@ -1,0 +1,14 @@
+[imap]
+server = imap.1blu.de
+port = 993
+user = your_imap_user
+password = your_imap_password
+folder_inbox = INBOX
+folder_fish = Fish
+
+[thresholds]
+auto_fish = 70
+kimi_check = 30
+
+[kimi]
+binary = /root/.local/bin/kimi
