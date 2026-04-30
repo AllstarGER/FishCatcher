@@ -1,1 +1,5 @@
 config.ini
+.last_uid
+__pycache__/
+*.pyc
+fishcatcher.py.bak-*

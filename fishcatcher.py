@@ -65,6 +65,43 @@ SAFE_URL_DOMAINS = {
     "wa-o.de", "werksarzt-online.de", "baz-west.de",
 }
 
+# Bank names must be reviewed by Claude even when the heuristic score is low.
+BANK_BRAND_PATTERNS = [
+    r"\bvolksbank\b",
+    r"\bvr\s*(?:banking|bank|eg)\b",
+    r"\bsparkasse\b",
+    r"\bpostbank\b",
+    r"\bdkb\b",
+    r"\btf\s*bank\b",
+    r"\btfbank\b",
+    r"\btargobank\b",
+    r"\bdeutsche\s+bank\b",
+    r"\bcommerzbank\b",
+    r"\bing(?:-diba)?\b",
+    r"\bcomdirect\b",
+    r"\bconsorsbank\b",
+    r"\bn26\b",
+]
+
+LEGIT_BANK_DOMAINS = {
+    "volksbank.de",
+    "vr.de",
+    "vr-bank.de",
+    "sparkasse.de",
+    "sparkasse-siegen.de",
+    "postbank.de",
+    "dkb.de",
+    "tfbank.de",
+    "targobank.de",
+    "deutsche-bank.de",
+    "commerzbank.de",
+    "ing.de",
+    "ing-diba.de",
+    "comdirect.de",
+    "consorsbank.de",
+    "n26.com",
+}
+
 
 def decode_mime_header(header_value):
     """Dekodiert MIME-kodierte Header-Werte."""
@@ -84,7 +121,7 @@ def decode_mime_header(header_value):
 
 
 def get_body(msg):
-    """Extrahiert den Body einer E-Mail (plain text bevorzugt, sonst HTML)."""
+    """Extrahiert Plaintext und HTML, damit HTML-only Links sichtbar bleiben."""
     body_plain = ""
     body_html = ""
     if msg.is_multipart():
@@ -109,6 +146,8 @@ def get_body(msg):
                 body_html = text
             else:
                 body_plain = text
+    if body_plain and body_html and body_html not in body_plain:
+        return body_plain + "\n\n--- HTML ---\n" + body_html
     return body_plain or body_html
 
 
@@ -286,6 +325,44 @@ def check_from_domain_spoofing(msg):
     return 0
 
 
+def domain_matches(domain, allowed_domains):
+    if not domain:
+        return False
+    return any(domain == allowed or domain.endswith("." + allowed) for allowed in allowed_domains)
+
+
+def get_from_domain(msg):
+    from_addr = parseaddr(msg.get("From", ""))[1].lower()
+    if not from_addr or "@" not in from_addr:
+        return ""
+    return from_addr.split("@")[-1]
+
+
+def has_bank_brand_signal(msg, body=None):
+    if body is None:
+        body = get_body(msg)
+    subject = decode_mime_header(msg.get("Subject", ""))
+    from_header = decode_mime_header(msg.get("From", ""))
+    text = " ".join([subject, from_header, body[:3000]]).lower()
+    return any(re.search(pattern, text, re.I) for pattern in BANK_BRAND_PATTERNS)
+
+
+def check_bank_brand_mismatch(msg, body=None):
+    """Bank/VR/Sparkasse-Absender von fremden Domains sind ein starkes Signal."""
+    if body is None:
+        body = get_body(msg)
+    if not has_bank_brand_signal(msg, body):
+        return 0
+    from_domain = get_from_domain(msg)
+    if domain_matches(from_domain, LEGIT_BANK_DOMAINS):
+        return 0
+    return 30
+
+
+def requires_claude_review(msg, body=None):
+    return has_bank_brand_signal(msg, body)
+
+
 def _get_legit_domains(brand):
     """Gibt bekannte legitime Domains für eine Marke zurück."""
     mapping = {
@@ -315,6 +392,7 @@ def calculate_score(msg):
         ("suspicious_attachments", check_attachments(msg)),
         ("encoding_tricks", check_encoding_tricks(msg)),
         ("domain_spoofing", check_from_domain_spoofing(msg)),
+        ("bank_brand_mismatch", check_bank_brand_mismatch(msg, body)),
     ]
 
     total = 0
@@ -365,15 +443,20 @@ def ask_claude(msg, config):
         output = result.stdout.strip()
         if not output and result.returncode != 0:
             log.warning(f"Claude Fehler (exit {result.returncode}): {result.stderr[:200]}")
-            return False
+            return None
         log.info(f"Claude Antwort: {output[:200]}")
-        return output.upper().startswith("PHISHING")
+        if output.upper().startswith("PHISHING"):
+            return True
+        if output.upper().startswith("SAFE"):
+            return False
+        log.warning(f"Claude Antwort nicht eindeutig: {output[:200]}")
+        return None
     except subprocess.TimeoutExpired:
         log.warning("Claude Timeout nach 60s")
-        return False
+        return None
     except Exception as e:
         log.error(f"Claude Fehler: {e}")
-        return False
+        return None
 
 
 def get_last_uid():
@@ -419,7 +502,7 @@ def move_to_fish(imap_conn, uid, folder_fish):
 
 
 def process_mailbox(config):
-    """Hauptlogik: Verbindet sich mit IMAP und prüft ungelesene Mails."""
+    """Hauptlogik: Verbindet sich mit IMAP und prüft neue Mails per UID."""
     server = config.get("imap", "server")
     port = config.getint("imap", "port")
     user = config.get("imap", "user")
@@ -437,7 +520,9 @@ def process_mailbox(config):
     conn.select(folder_inbox)
 
     last_uid = get_last_uid()
-    search_query = f"UNSEEN UID {last_uid+1}:*" if last_uid > 0 else "UNSEEN"
+    # Scan by UID, not by UNSEEN. BODY.PEEK below preserves unread flags for FreeScout,
+    # while already-read-but-new messages are still reviewed.
+    search_query = f"UID {last_uid+1}:*" if last_uid > 0 else "ALL"
 
     status, data = conn.uid("SEARCH", None, search_query)
     if status != "OK" or not data[0]:
@@ -445,12 +530,19 @@ def process_mailbox(config):
         conn.logout()
         return
 
-    uids = data[0].split()
-    log.info(f"{len(uids)} ungelesene Mail(s) gefunden")
+    raw_uids = data[0].split()
+    uids = [uid for uid in raw_uids if int(uid) > last_uid]
+    if not uids:
+        log.info("Keine neuen Mails seit letztem Lauf")
+        conn.logout()
+        return
+
+    log.info(f"{len(uids)} neue Mail(s) gefunden")
 
     moved = 0
     for uid in uids:
-        status, msg_data = conn.uid("FETCH", uid, "(RFC822)")
+        # Read the full message without setting \Seen so FreeScout can still import it.
+        status, msg_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
         if status != "OK":
             continue
 
@@ -458,27 +550,42 @@ def process_mailbox(config):
         msg = email.message_from_bytes(raw_email)
         subject = decode_mime_header(msg.get("Subject", ""))
         from_addr = msg.get("From", "")
+        body = get_body(msg)
 
         score, details = calculate_score(msg)
         detail_str = ", ".join(details) if details else "none"
         log.info(f"Mail: '{subject}' von {from_addr} — Score: {score} ({detail_str})")
 
-        if score >= threshold_auto:
+        needs_claude = requires_claude_review(msg, body)
+
+        if needs_claude:
+            log.info("  → Bank-/Finanzmarke erkannt, frage Claude unabhängig vom Score...")
+            claude_result = ask_claude(msg, config)
+            if claude_result is True:
+                log.info(f"  → Claude: PHISHING, verschiebe nach {folder_fish}")
+                if move_to_fish(conn, uid, folder_fish):
+                    moved += 1
+            elif claude_result is False:
+                log.info("  → Claude: SAFE, belasse in INBOX ohne Flags zu ändern")
+            else:
+                log.warning("  → Claude ohne eindeutige Entscheidung, belasse in INBOX ohne Flags zu ändern")
+        elif score >= threshold_auto:
             log.info(f"  → PHISHING (Score {score} >= {threshold_auto}), verschiebe nach {folder_fish}")
             if move_to_fish(conn, uid, folder_fish):
                 moved += 1
         elif score >= threshold_claude:
             log.info(f"  → Score {score}, frage Claude...")
-            if ask_claude(msg, config):
+            claude_result = ask_claude(msg, config)
+            if claude_result is True:
                 log.info(f"  → Claude: PHISHING, verschiebe nach {folder_fish}")
                 if move_to_fish(conn, uid, folder_fish):
                     moved += 1
+            elif claude_result is False:
+                log.info("  → Claude: SAFE, belasse in INBOX ungelesen fuer FreeScout")
             else:
-                log.info(f"  → Claude: SAFE, belasse in INBOX")
-                conn.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+                log.warning("  → Claude ohne eindeutige Entscheidung, belasse in INBOX ohne Flags zu ändern")
         else:
-            log.info(f"  → SAFE (Score {score} < {threshold_claude})")
-            conn.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+            log.info(f"  → SAFE (Score {score} < {threshold_claude}), belasse in INBOX ungelesen fuer FreeScout")
 
     log.info(f"Fertig. {moved} Mail(s) nach {folder_fish} verschoben")
 
