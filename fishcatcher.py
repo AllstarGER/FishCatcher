@@ -11,6 +11,11 @@ import fcntl
 import logging
 import configparser
 import subprocess
+import shutil
+import html
+import unicodedata
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urlparse
 from email.utils import parseaddr
 
 # --- Konfiguration ---
@@ -18,6 +23,10 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.i
 LOCK_FILE = "/tmp/fishcatcher.lock"
 LOG_FILE = "/var/log/fishcatcher.log"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_uid")
+DEFAULT_SPAM_FOLDER = "Spam"
+DEFAULT_SPAMASSASSIN_THRESHOLD = 8.0
+DEFAULT_SPAMASSASSIN_TIMEOUT = 20
+DEFAULT_SPAMASSASSIN_MAX_BYTES = 750000
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -37,6 +46,12 @@ URGENCY_KEYWORDS = [
     r"letzte.*warnung", r"final.*warning", r"sicherheits.*warnung",
     r"ungewöhnliche.*aktivität", r"unusual.*activity",
     r"zahlung.*fehlgeschlagen", r"payment.*failed",
+    r"zahlung.*fällig", r"zahlung.*faellig", r"fälliger.*betrag",
+    r"faelliger.*betrag", r"rechnung.*fällig", r"rechnung.*faellig",
+    r"domain.*verlänger", r"domain.*verlaenger", r"verlänger.*domain",
+    r"verlaenger.*domain", r"domain.*gesperrt",
+    r"dienste.*gesperrt", r"service.*suspend", r"service.*gesperrt",
+    r"zugang.*gesperrt", r"login.*erforderlich",
     r"steuererstattung", r"tax.*refund",
     r"gewonnen", r"you.*won", r"prize",
     r"lotterie", r"lottery",
@@ -47,6 +62,57 @@ SUSPICIOUS_EXTENSIONS = {".exe", ".scr", ".js", ".vbs", ".bat", ".cmd", ".pif", 
 
 # --- URL-Shortener Domains ---
 URL_SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "buff.ly", "ow.ly", "rebrand.ly", "cutt.ly"}
+
+URL_PATTERN = re.compile(r'https?://[^\s<>"\']+', re.I)
+DOMAIN_TEXT_PATTERN = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b", re.I)
+LINK_REWRITE_TARGET_PARAMS = {
+    "safelinks.protection.outlook.com": ("url",),
+}
+FILE_LIKE_LINK_TEXT_TLDS = {
+    "7z", "bat", "bin", "bmp", "csv", "doc", "docx", "exe", "gif", "ics",
+    "jpeg", "jpg", "js", "json", "pdf", "png", "ppt", "pptx", "rar", "rtf",
+    "svg", "txt", "webp", "xls", "xlsx", "xml", "zip",
+}
+
+SUSPICIOUS_TLDS = {
+    "shop", "xyz", "top", "club", "info", "online", "site", "website",
+    "buzz", "click", "link", "win", "bid", "loan", "racing", "review",
+    "stream", "gq", "cf", "tk", "ml", "ga", "icu", "rest", "monster",
+}
+
+LEGIT_BUSINESS_TLDS = {"de", "com", "net", "org", "eu", "at", "ch"}
+COMMON_VISIBLE_DOMAIN_TLDS = LEGIT_BUSINESS_TLDS | SUSPICIOUS_TLDS | {
+    "ai", "app", "be", "ca", "co", "dev", "dk", "es", "fi", "fr", "io",
+    "it", "me", "nl", "no", "pl", "se", "uk", "us",
+}
+GENERIC_BANK_CLAIM_PATTERN = re.compile(
+    r"\b(?:(?P<separated>[a-z0-9][a-z0-9-]{1,40})\s+bank|(?P<compound>[a-z0-9][a-z0-9-]{1,40}bank))\b",
+    re.I,
+)
+NON_FINANCIAL_BANK_CLAIM_TOKENS = {
+    "bloodbank",
+    "blutbank",
+    "datenbank",
+    "databank",
+    "samenbank",
+    "spermabank",
+    "biobank",
+    "gewebebank",
+}
+BANK_ABUSE_CONTEXT_PATTERNS = [
+    r"\bkonto\b", r"\baccount\b", r"\bzugang\b", r"\blogin\b",
+    r"\bonline\s*banking\b", r"\bbanking\b", r"\bsecurego\b",
+    r"\bprofil\b", r"\bkarte\b", r"\bdaten(?:abgleich|stand)?\b",
+    r"\baktualis", r"\bbestätig", r"\bbestaetig", r"\bprüfung\b",
+    r"\bpruefung\b", r"\bstatusmeldung\b", r"\bsicherheit",
+    r"\bverifiz", r"\baktion\s+erforderlich\b",
+]
+GERMAN_ASCII_REPLACEMENTS = {
+    "ä": "ae",
+    "ö": "oe",
+    "ü": "ue",
+    "ß": "ss",
+}
 
 # --- Bekannte sichere Domains (CDN, SaaS, Business-Tools) ---
 SAFE_URL_DOMAINS = {
@@ -74,6 +140,9 @@ BANK_BRAND_PATTERNS = [
     r"\bdkb\b",
     r"\btf\s*bank\b",
     r"\btfbank\b",
+    r"\bapo\s*bank\b",
+    r"\bapobank\b",
+    r"\bapotheker\s*(?:und|&)?\s*(?:aerzte|ärzte)?\s*bank\b",
     r"\btargobank\b",
     r"\bdeutsche\s+bank\b",
     r"\bcommerzbank\b",
@@ -89,9 +158,11 @@ LEGIT_BANK_DOMAINS = {
     "vr-bank.de",
     "sparkasse.de",
     "sparkasse-siegen.de",
+    "s-web.de",
     "postbank.de",
     "dkb.de",
     "tfbank.de",
+    "apobank.de",
     "targobank.de",
     "deutsche-bank.de",
     "commerzbank.de",
@@ -100,6 +171,227 @@ LEGIT_BANK_DOMAINS = {
     "comdirect.de",
     "consorsbank.de",
     "n26.com",
+}
+
+# Allgemeine Markenregeln: Wenn eine bekannte Marke in Anzeigename/Betreff
+# auftaucht, muss die From-Domain zu einer bekannten legitimen Domain passen.
+# Body-only Treffer werden nur mit Phishing-Kontext gewertet, um normale
+# Kundenantworten oder Signaturen nicht zu hart zu bestrafen.
+BRAND_SPOOFING_RULES = [
+    {
+        "name": "1blu",
+        "patterns": [r"\b1\s*blu\b"],
+        "domains": {"1blu.de"},
+        "body_context": "hosting",
+    },
+    {
+        "name": "IONOS",
+        "patterns": [r"\bionos\b", r"\b1\s*&\s*1\b", r"\b1\s*und\s*1\b", r"\b1und1\b"],
+        "domains": {"ionos.de", "ionos.com", "1und1.de", "1und1.com"},
+        "body_context": "hosting",
+    },
+    {
+        "name": "STRATO",
+        "patterns": [r"\bstrato\b"],
+        "domains": {"strato.de", "strato.com"},
+        "body_context": "hosting",
+    },
+    {
+        "name": "All-Inkl",
+        "patterns": [r"\ball-?inkl\b", r"\ballinkl\b"],
+        "domains": {"all-inkl.com", "all-inkl.de"},
+        "body_context": "hosting",
+    },
+    {
+        "name": "Host Europe",
+        "patterns": [r"\bhost\s*europe\b"],
+        "domains": {"hosteurope.de", "hosteurope.com"},
+        "body_context": "hosting",
+    },
+    {
+        "name": "DomainFactory",
+        "patterns": [r"\bdomain\s*factory\b", r"\bdomainfactory\b"],
+        "domains": {"df.eu", "domainfactory.de"},
+        "body_context": "hosting",
+    },
+    {
+        "name": "United Domains",
+        "patterns": [r"\bunited\s*domains\b", r"\bunited-domains\b"],
+        "domains": {"united-domains.de", "united-domains.com"},
+        "body_context": "hosting",
+    },
+    {
+        "name": "GMX",
+        "patterns": [r"\bgmx\b"],
+        "domains": {"gmx.de", "gmx.net", "gmx.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "WEB.DE",
+        "patterns": [r"\bweb\.de\b"],
+        "domain_patterns": [r"^web\.de$"],
+        "domains": {"web.de"},
+        "body_context": "account",
+    },
+    {
+        "name": "Telekom",
+        "patterns": [r"\btelekom\b", r"\bt-?online\b", r"\bt-?systems\b"],
+        "domains": {"telekom.de", "t-online.de", "t-systems.de"},
+        "body_context": "account",
+    },
+    {
+        "name": "Vodafone",
+        "patterns": [r"\bvodafone\b"],
+        "domains": {"vodafone.de", "vodafone.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "O2",
+        "patterns": [r"\bo2\s*(?:online|business|kundenservice|service|rechnung)\b", r"\btelefonica\b", r"\btelefónica\b"],
+        "contextual_display_patterns": [r"^\s*o2\s*$"],
+        "contextual_subject_patterns": [r"\bo2\b"],
+        "domains": {"o2online.de", "telefonica.de", "telefonica.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "PayPal",
+        "patterns": [r"\bpay\s*pal\b", r"\bpaypal\b"],
+        "domains": {"paypal.com", "paypal.de"},
+        "body_context": "payment",
+    },
+    {
+        "name": "Amazon",
+        "patterns": [r"\bamazon\b"],
+        "domains": {"amazon.de", "amazon.com", "amazonaws.com"},
+        "body_context": "payment",
+    },
+    {
+        "name": "eBay",
+        "patterns": [r"\bebay\b"],
+        "domains": {"ebay.de", "ebay.com"},
+        "body_context": "payment",
+    },
+    {
+        "name": "DHL",
+        "patterns": [r"\bdhl\b", r"\bdeutsche\s*post\b"],
+        "domains": {"dhl.de", "dhl.com", "deutschepost.de"},
+        "body_context": "delivery",
+    },
+    {
+        "name": "Hermes",
+        "patterns": [r"\bhermes\b"],
+        "domains": {"hermesworld.com", "myhermes.de"},
+        "body_context": "delivery",
+    },
+    {
+        "name": "DPD",
+        "patterns": [r"\bdpd\b"],
+        "domains": {"dpd.de", "dpd.com", "dpdgroup.com"},
+        "body_context": "delivery",
+    },
+    {
+        "name": "UPS",
+        "patterns": [r"\bups\b"],
+        "domains": {"ups.com"},
+        "body_context": "delivery",
+    },
+    {
+        "name": "GLS",
+        "patterns": [r"\bgls\b"],
+        "domains": {"gls-group.com", "gls-pakete.de"},
+        "body_context": "delivery",
+    },
+    {
+        "name": "FedEx",
+        "patterns": [r"\bfedex\b", r"\bfed\s*ex\b"],
+        "domains": {"fedex.com"},
+        "body_context": "delivery",
+    },
+    {
+        "name": "Microsoft",
+        "patterns": [r"\bmicrosoft\b", r"\boffice\s*365\b", r"\bmicrosoft\s*365\b"],
+        "domain_patterns": [r"\bmicrosoft\b", r"microsoft\s*365", r"office\s*365"],
+        "domains": {"microsoft.com", "microsoft.de", "microsoft365.com", "office.com", "office365.com"},
+        "consumer_domains": {"outlook.com", "hotmail.com", "live.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "Google",
+        "patterns": [r"\bgoogle\b"],
+        "domain_patterns": [r"\bgoogle\b"],
+        "domains": {"google.com", "google.de"},
+        "consumer_domains": {"gmail.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "Apple",
+        "patterns": [r"\bapple\b", r"\bicloud\b"],
+        "domains": {"apple.com", "icloud.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "Adobe",
+        "patterns": [r"\badobe\b"],
+        "domains": {"adobe.com"},
+        "body_context": "document",
+    },
+    {
+        "name": "DocuSign",
+        "patterns": [r"\bdocusign\b", r"\bdocu\s*sign\b"],
+        "domains": {"docusign.com", "docusign.net"},
+        "body_context": "document",
+    },
+    {
+        "name": "Dropbox",
+        "patterns": [r"\bdropbox\b"],
+        "domains": {"dropbox.com", "dropboxmail.com"},
+        "body_context": "document",
+    },
+    {
+        "name": "LinkedIn",
+        "patterns": [r"\blinkedin\b", r"\blinked\s*in\b"],
+        "domains": {"linkedin.com", "linkedinmail.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "XING",
+        "patterns": [r"\bxing\b"],
+        "domains": {"xing.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "Mercedes-Benz",
+        "patterns": [r"\bmercedes(?:\s|-)*benz\b", r"\bmercedes\b"],
+        "domains": {"mercedes-benz.de", "mercedes-benz.com", "mercedes.me"},
+        "body_context": "payment",
+    },
+]
+
+BRAND_BODY_CONTEXT_PATTERNS = {
+    "hosting": [
+        r"\bdomain(?:s)?\b", r"\bhosting\b", r"\bvertrag\b",
+        r"\brechnung\b", r"\bverlänger", r"\bfaellig\b", r"\bfällig\b",
+        r"\bgesperrt\b", r"\bzahlung\b",
+    ],
+    "account": [
+        r"\bkonto\b", r"\baccount\b", r"\blogin\b", r"\bpasswort\b",
+        r"\bverify\b", r"\bverifiz", r"\bbestätig", r"\bgesperrt\b",
+        r"\bsicherheits", r"\bsecurity\b", r"\balert\b", r"\bablauf\b",
+        r"\bexpire", r"\bläuft\s+ab\b", r"\blaeuft\s+ab\b",
+    ],
+    "payment": [
+        r"\brechnung\b", r"\bzahlung\b", r"\bbezahlen\b", r"\bfällig\b",
+        r"\bfaellig\b", r"\bmahnung\b", r"\bbetrag\b", r"\bkarte\b",
+    ],
+    "delivery": [
+        r"\bpaket\b", r"\bsendung\b", r"\bliefer", r"\bzoll\b",
+        r"\bgebühr\b", r"\bgebuehr\b", r"\badresse\b",
+    ],
+    "document": [
+        r"\bdokument", r"\bdocument", r"\bvertrag\b", r"\buntersch",
+        r"\bsign", r"\bsignatur\b", r"\bfreigabe\b", r"\bgeteilt\b",
+        r"\bshared\b", r"\bdatei\b", r"\bfile\b",
+    ],
 }
 
 
@@ -118,6 +410,34 @@ def decode_mime_header(header_value):
         else:
             decoded.append(part)
     return " ".join(decoded)
+
+
+def normalize_match_text(text):
+    """Normalisiert Text fuer Regex-Matching, inkl. Zero-Width-Zeichen."""
+    text = html.unescape(str(text or ""))
+    text = unicodedata.normalize("NFKC", text)
+    chars = []
+    for char in text:
+        category = unicodedata.category(char)
+        if category == "Cf":
+            continue
+        if category.startswith("C"):
+            if char.isspace():
+                chars.append(" ")
+            continue
+        chars.append(char)
+    return re.sub(r"\s+", " ", "".join(chars)).strip().casefold()
+
+
+def ascii_match_text(text):
+    text = normalize_match_text(text)
+    for source, target in GERMAN_ASCII_REPLACEMENTS.items():
+        text = text.replace(source, target)
+    return text
+
+
+def compact_match_text(text):
+    return re.sub(r"[^a-z0-9]+", "", ascii_match_text(text))
 
 
 def get_body(msg):
@@ -151,9 +471,140 @@ def get_body(msg):
     return body_plain or body_html
 
 
+def iter_url_matches(text):
+    return URL_PATTERN.finditer(text or "")
+
+
 def extract_urls(text):
     """Extrahiert URLs aus Text."""
-    return re.findall(r'https?://[^\s<>"\']+', text, re.IGNORECASE)
+    return [match.group(0) for match in iter_url_matches(text)]
+
+
+class LinkTextParser(HTMLParser):
+    """Extrahiert sichtbaren Anchor-Text mit zugehoerigem href."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self._active = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        href = ""
+        for name, value in attrs:
+            if name.lower() == "href":
+                href = value or ""
+                break
+        self._active.append({"href": href, "text": []})
+
+    def handle_data(self, data):
+        if self._active:
+            self._active[-1]["text"].append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() != "a" or not self._active:
+            return
+        link = self._active.pop()
+        self.links.append((link["href"], "".join(link["text"])))
+
+    def finish(self):
+        while self._active:
+            link = self._active.pop()
+            self.links.append((link["href"], "".join(link["text"])))
+
+
+def extract_html_links(body):
+    parser = LinkTextParser()
+    try:
+        parser.feed(body or "")
+        parser.close()
+        parser.finish()
+    except Exception:
+        return []
+    return parser.links
+
+
+def get_url_domain(value):
+    value = html.unescape(value or "").strip().strip("<>\"'")
+    value = value.rstrip(").,;:!?]}")
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if not parsed.netloc and not parsed.scheme:
+        parsed = urlparse("https://" + value)
+    return normalize_domain(parsed.hostname or "")
+
+
+def domains_equivalent_or_nested(visible_domain, href_domain):
+    visible_domain = normalize_domain(visible_domain)
+    href_domain = normalize_domain(href_domain)
+    if not visible_domain or not href_domain:
+        return False
+    return domain_matches(href_domain, {visible_domain}) or domain_matches(visible_domain, {href_domain})
+
+
+def get_link_rewrite_target_params(href_domain):
+    for rewrite_domain, params in LINK_REWRITE_TARGET_PARAMS.items():
+        if domain_matches(href_domain, {rewrite_domain}):
+            return params
+    return ()
+
+
+def extract_rewritten_href_domains(href):
+    return {domain for domain in (get_url_domain(url) for url in extract_rewritten_href_urls(href)) if domain}
+
+
+def extract_rewritten_href_urls(href):
+    href = html.unescape(href or "").strip()
+    parsed = urlparse(href)
+    href_domain = normalize_domain(parsed.hostname or "")
+    target_params = get_link_rewrite_target_params(href_domain)
+    if not target_params:
+        return []
+    urls = []
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    for param in target_params:
+        for value in query.get(param, []):
+            if get_url_domain(value):
+                urls.append(value)
+    return urls
+
+
+def looks_like_dotted_abbreviation(text, start, end, candidate, domain):
+    labels = domain.split(".")
+    if len(labels) < 2 or get_domain_tld(domain) in COMMON_VISIBLE_DOMAIN_TLDS:
+        return False
+    if any(len(label) > 2 or re.search(r"[-0-9]", label) for label in labels[:-1]):
+        return False
+    raw_labels = candidate.split(".")
+    has_abbreviation_casing = any(any(char.isupper() for char in label) for label in raw_labels)
+    has_trailing_period = end < len(text) and text[end] == "."
+    return has_abbreviation_casing or has_trailing_period
+
+
+def extract_visible_link_domains(text):
+    text = html.unescape(text or "")
+    domains = set()
+    url_spans = []
+    for match in iter_url_matches(text):
+        url_spans.append(match.span())
+        domain = get_url_domain(match.group(0))
+        if domain:
+            domains.add(domain)
+    for match in DOMAIN_TEXT_PATTERN.finditer(text):
+        start, end = match.span()
+        if any(start >= url_start and end <= url_end for url_start, url_end in url_spans):
+            continue
+        domain = normalize_domain(match.group(0))
+        tld = get_domain_tld(domain)
+        if tld not in FILE_LIKE_LINK_TEXT_TLDS and not looks_like_dotted_abbreviation(
+            text, start, end, match.group(0), domain
+        ):
+            domains.add(domain)
+    return domains
 
 
 def is_safe_url(url):
@@ -224,21 +675,63 @@ def check_urls(body):
         return 0
     score = 0
     for url in urls:
-        # Bekannte sichere Domains überspringen
-        if is_safe_url(url):
-            continue
-        # IP-basierte URLs
-        if re.search(r'https?://\d+\.\d+\.\d+\.\d+', url):
-            score += 10
-        # URL-Shortener
-        for shortener in URL_SHORTENERS:
-            if shortener in url.lower():
-                score += 5
-                break
-        # HTTP statt HTTPS bei Login/Banking-Keywords
-        if url.startswith("http://") and re.search(r'login|bank|secure|account|paypal|verify', url, re.I):
-            score += 10
+        effective_urls = extract_rewritten_href_urls(url) or [url]
+        for effective_url in effective_urls:
+            # Bekannte sichere Domains überspringen; bei Rewrite-Links zählt das echte Ziel.
+            if is_safe_url(effective_url):
+                continue
+            # IP-basierte URLs
+            if re.search(r'https?://\d+\.\d+\.\d+\.\d+', effective_url):
+                score += 10
+            # URL-Shortener
+            for shortener in URL_SHORTENERS:
+                if shortener in effective_url.lower():
+                    score += 5
+                    break
+            # HTTP statt HTTPS bei Login/Banking-Keywords
+            if effective_url.startswith("http://") and re.search(r'login|bank|secure|account|paypal|verify', effective_url, re.I):
+                score += 10
     return min(score, 20)
+
+
+def get_link_text_href_mismatch_score(body):
+    """Flaggt Links, deren sichtbare Domain nicht zur tatsaechlichen href-Domain passt."""
+    for href, text in extract_html_links(body):
+        href_domain = get_url_domain(href)
+        if not href_domain:
+            continue
+        rewritten_domains = extract_rewritten_href_domains(href)
+        for visible_domain in extract_visible_link_domains(text):
+            if not visible_domain:
+                continue
+            if rewritten_domains:
+                if any(domains_equivalent_or_nested(visible_domain, rewritten_domain) for rewritten_domain in rewritten_domains):
+                    continue
+                return 35
+            if domains_equivalent_or_nested(visible_domain, href_domain):
+                continue
+            return 35
+    return 0
+
+
+def has_link_text_href_mismatch_signal(body):
+    return get_link_text_href_mismatch_score(body) >= 30
+
+
+def get_spamc_binary(config):
+    return config.get("spamassassin", "spamc_binary", fallback=shutil.which("spamc") or "")
+
+
+def get_spamassassin_binary(config):
+    return config.get("spamassassin", "spamassassin_binary", fallback=shutil.which("spamassassin") or "")
+
+
+def is_spamassassin_configured(config):
+    return (
+        config.has_section("spamassassin")
+        and config.getboolean("spamassassin", "enabled", fallback=False)
+        and bool(get_spamc_binary(config) or get_spamassassin_binary(config))
+    )
 
 
 def check_urgency_keywords(body, subject):
@@ -295,37 +788,33 @@ def check_from_domain_spoofing(msg):
     domain = from_addr.split("@")[-1]
     tld = domain.rsplit(".", 1)[-1] if "." in domain else ""
 
-    # Verdächtige TLDs die oft für Phishing genutzt werden
-    suspicious_tlds = {
-        "shop", "xyz", "top", "club", "info", "online", "site", "website",
-        "buzz", "click", "link", "win", "bid", "loan", "racing", "review",
-        "stream", "gq", "cf", "tk", "ml", "ga", "icu", "rest", "monster",
-    }
-
     # Bekannte Marken die oft imitiert werden
     brands = ["telekom", "paypal", "amazon", "dhl", "sparkasse", "volksbank",
               "postbank", "microsoft", "google", "apple", "netflix", "dkb"]
 
-    # Legitime länderspezifische TLDs für deutsche Geschäftsmails
-    legit_tlds = {"de", "com", "net", "org", "eu", "at", "ch"}
-
     for brand in brands:
         if brand in domain:
             # Verdächtige TLD + Markenname = starkes Signal
-            if tld in suspicious_tlds:
+            if tld in SUSPICIOUS_TLDS:
                 return 20
             # Bekannte Marke aber mit ungewöhnlicher Länder-TLD (telekomro.com → .com aber "ro" im Namen)
-            if tld in legit_tlds and domain not in _get_legit_domains(brand):
+            if tld in LEGIT_BUSINESS_TLDS and domain not in _get_legit_domains(brand):
                 # Nur flaggen wenn die Domain wie ein Typo aussieht
                 if re.search(r'[0-9]|(.)\1{2,}', domain):  # Zahlen oder Zeichenwiederholungen
                     return 15
             # Ausländische TLD die nicht zu DE-Marken passt
-            if tld not in legit_tlds and tld not in suspicious_tlds:
+            if tld not in LEGIT_BUSINESS_TLDS and tld not in SUSPICIOUS_TLDS:
                 return 10
     return 0
 
 
+def normalize_domain(domain):
+    """Normalisiert Domains aus Headern/URLs für robuste Vergleiche."""
+    return (domain or "").strip().strip(".").lower()
+
+
 def domain_matches(domain, allowed_domains):
+    domain = normalize_domain(domain)
     if not domain:
         return False
     return any(domain == allowed or domain.endswith("." + allowed) for allowed in allowed_domains)
@@ -335,32 +824,340 @@ def get_from_domain(msg):
     from_addr = parseaddr(msg.get("From", ""))[1].lower()
     if not from_addr or "@" not in from_addr:
         return ""
-    return from_addr.split("@")[-1]
+    return normalize_domain(from_addr.split("@")[-1])
+
+
+def get_domain_tld(domain):
+    domain = normalize_domain(domain)
+    return domain.rsplit(".", 1)[-1] if "." in domain else ""
+
+
+def brand_pattern_matches(patterns, text):
+    text = normalize_match_text(text)
+    return any(re.search(pattern, text, re.I) for pattern in patterns)
+
+
+def brand_matches_domain(rule, domain):
+    """Erkennt Marken auch in verschleierten Domains wie microsoft-login.example."""
+    domain = normalize_domain(domain)
+    if not domain:
+        return False
+    patterns = rule.get("domain_patterns", rule["patterns"])
+    domain_with_separators = re.sub(r"[-_.]+", " ", domain)
+    domain_compact = re.sub(r"[^a-z0-9]+", "", domain)
+    return (
+        brand_pattern_matches(patterns, domain)
+        or brand_pattern_matches(patterns, domain_with_separators)
+        or brand_pattern_matches(patterns, domain_compact)
+    )
+
+
+def body_has_brand_context(context, subject, body):
+    patterns = BRAND_BODY_CONTEXT_PATTERNS.get(context, [])
+    if not patterns:
+        return False
+    text = normalize_match_text(" ".join([subject or "", (body or "")[:3000]]))
+    return any(re.search(pattern, text, re.I) for pattern in patterns)
+
+
+def get_brand_spoofing_score(msg, body=None):
+    """Bewertet bekannte Marken auf fremden Absender-Domains."""
+    if body is None:
+        body = get_body(msg)
+
+    subject = decode_mime_header(msg.get("Subject", ""))
+    from_header = decode_mime_header(msg.get("From", ""))
+    display_name = parseaddr(from_header)[0]
+    from_domain = get_from_domain(msg)
+    from_tld = get_domain_tld(from_domain)
+    subject_text = normalize_match_text(subject)
+    display_text = normalize_match_text(display_name)
+    body_text = normalize_match_text((body or "")[:3000])
+    from_addr = parseaddr(from_header)[1].lower()
+    local_part = from_addr.split("@", 1)[0] if "@" in from_addr else ""
+    local_text = normalize_match_text(re.sub(r"[-_.+]+", " ", local_part))
+
+    for rule in BRAND_SPOOFING_RULES:
+        if domain_matches(from_domain, rule["domains"]):
+            continue
+
+        subject_brand = brand_pattern_matches(rule["patterns"], subject_text)
+        display_brand = brand_pattern_matches(rule["patterns"], display_text)
+        contextual_display_brand = brand_pattern_matches(rule.get("contextual_display_patterns", []), display_text)
+        contextual_subject_brand = brand_pattern_matches(rule.get("contextual_subject_patterns", []), subject_text)
+        local_brand = brand_pattern_matches(rule.get("domain_patterns", rule["patterns"]), local_text)
+        body_brand = brand_pattern_matches(rule["patterns"], body_text)
+        domain_brand = brand_matches_domain(rule, from_domain)
+        suspicious_tld = from_tld in SUSPICIOUS_TLDS
+        consumer_domain = domain_matches(from_domain, rule.get("consumer_domains", set()))
+        has_abuse_context = body_has_brand_context(rule.get("body_context"), subject, body) or text_has_bank_abuse_context(
+            subject, body[:3000]
+        )
+
+        # Der Anzeigename behauptet eine Marke, aber die From-Domain passt nicht.
+        # Das ist das stärkste generische Spoofing-Signal.
+        if display_brand:
+            if consumer_domain and not has_abuse_context:
+                continue
+            return 45 if suspicious_tld else 40
+
+        # Sehr kurze Marken wie O2 brauchen den Missbrauchskontext separat:
+        # "O2 Saettigung" soll harmlos bleiben, "O2" + "Login erforderlich" nicht.
+        if contextual_display_brand and has_abuse_context:
+            return 45 if suspicious_tld else 40
+
+        # Markenname steckt in einer fremden Domain, z.B.
+        # mercedes-benz.de.ejharris.com oder telekom-login.example.
+        if domain_brand:
+            return 40 if suspicious_tld else 35
+
+        # Gmail/Outlook/Hotmail sind nutzerkontrolliert. Betreff- oder
+        # Local-Part-Markennennungen sind dort zu laut; nur der Anzeigename
+        # darf oben mit Missbrauchskontext als starkes Signal zaehlen.
+        if consumer_domain:
+            continue
+
+        # Betreff-only Markennennung zaehlt nur mit typischem Missbrauchskontext.
+        # Body-only Mentions sind normale Drittanbieter-/Weiterleitungsinhalte.
+        if (subject_brand or contextual_subject_brand or local_brand or body_brand) and has_abuse_context:
+            return 30
+
+    return 0
+
+
+def has_brand_spoofing_signal(msg, body=None):
+    return get_brand_spoofing_score(msg, body) >= 30
+
+
+def text_has_bank_abuse_context(*parts):
+    text = normalize_match_text(" ".join(part or "" for part in parts))
+    return any(re.search(pattern, text, re.I) for pattern in BANK_ABUSE_CONTEXT_PATTERNS)
+
+
+def extract_generic_bank_claim_tokens(text, allow_compound=True):
+    """Extrahiert behauptete Banknamen wie 'apoBank' oder 'Muster Bank'."""
+    text = ascii_match_text(text)
+    tokens = set()
+    for match in GENERIC_BANK_CLAIM_PATTERN.finditer(text):
+        compound = match.group("compound")
+        if compound and not allow_compound:
+            continue
+        token_text = compound or f"{match.group('separated')} bank"
+        token = compact_match_text(token_text)
+        if len(token) >= 5 and token not in {"bank", "onlinebank"} | NON_FINANCIAL_BANK_CLAIM_TOKENS:
+            tokens.add(token)
+    return tokens
+
+
+def bank_pattern_matches_domain(domain):
+    domain = normalize_domain(domain)
+    if not domain:
+        return False
+    domain_with_separators = re.sub(r"[-_.]+", " ", domain)
+    domain_compact = compact_match_text(domain)
+    return (
+        brand_pattern_matches(BANK_BRAND_PATTERNS, domain)
+        or brand_pattern_matches(BANK_BRAND_PATTERNS, domain_with_separators)
+        or brand_pattern_matches(BANK_BRAND_PATTERNS, domain_compact)
+    )
+
+
+def sender_domain_matches_generic_bank_claim(from_domain, claim_tokens):
+    from_domain = normalize_domain(from_domain)
+    if get_domain_tld(from_domain) in SUSPICIOUS_TLDS:
+        return False
+    labels = from_domain.split(".")
+    if len(labels) < 2:
+        return False
+    sender_stem = compact_match_text(labels[-2])
+    return any(sender_stem == token for token in claim_tokens)
+
+
+def get_bank_claim_parts(msg):
+    subject = decode_mime_header(msg.get("Subject", ""))
+    from_header = decode_mime_header(msg.get("From", ""))
+    display_name = parseaddr(from_header)[0]
+    return subject, display_name
+
+
+def get_bank_sender_claim_mismatch_score(msg, body=None):
+    """Flaggt Bank-Absenderclaims, deren From-Domain nicht zur behaupteten Bank passt."""
+    if body is None:
+        body = get_body(msg)
+
+    subject, display_name = get_bank_claim_parts(msg)
+    from_domain = get_from_domain(msg)
+    if not from_domain:
+        return 0
+
+    has_context = text_has_bank_abuse_context(subject, body[:1000])
+    from_header = decode_mime_header(msg.get("From", ""))
+    from_addr = parseaddr(from_header)[1].lower()
+    local_part = from_addr.split("@", 1)[0] if "@" in from_addr else ""
+    local_text = re.sub(r"[-_.+]+", " ", local_part)
+    display_known = brand_pattern_matches(BANK_BRAND_PATTERNS, display_name)
+    subject_known = brand_pattern_matches(BANK_BRAND_PATTERNS, subject)
+    domain_known = bank_pattern_matches_domain(from_domain)
+    local_known = brand_pattern_matches(BANK_BRAND_PATTERNS, local_text) and has_context
+    body_known = brand_pattern_matches(BANK_BRAND_PATTERNS, (body or "")[:3000]) and has_context
+    display_tokens = extract_generic_bank_claim_tokens(display_name, allow_compound=has_context)
+    subject_tokens = extract_generic_bank_claim_tokens(subject) if has_context else set()
+    claim_tokens = display_tokens | subject_tokens
+
+    if not (display_known or subject_known or domain_known or local_known or body_known or claim_tokens):
+        return 0
+    if domain_matches(from_domain, LEGIT_BANK_DOMAINS):
+        return 0
+    if claim_tokens and sender_domain_matches_generic_bank_claim(from_domain, claim_tokens):
+        return 0
+    return 30
+
+
+def has_bank_sender_claim_mismatch_signal(msg, body=None):
+    return get_bank_sender_claim_mismatch_score(msg, body) >= 30
 
 
 def has_bank_brand_signal(msg, body=None):
     if body is None:
         body = get_body(msg)
-    subject = decode_mime_header(msg.get("Subject", ""))
-    from_header = decode_mime_header(msg.get("From", ""))
-    text = " ".join([subject, from_header, body[:3000]]).lower()
-    return any(re.search(pattern, text, re.I) for pattern in BANK_BRAND_PATTERNS)
+    return has_bank_sender_claim_mismatch_signal(msg, body)
 
 
 def check_bank_brand_mismatch(msg, body=None):
     """Bank/VR/Sparkasse-Absender von fremden Domains sind ein starkes Signal."""
-    if body is None:
-        body = get_body(msg)
-    if not has_bank_brand_signal(msg, body):
-        return 0
-    from_domain = get_from_domain(msg)
-    if domain_matches(from_domain, LEGIT_BANK_DOMAINS):
-        return 0
-    return 30
+    return get_bank_sender_claim_mismatch_score(msg, body)
 
 
 def requires_claude_review(msg, body=None):
-    return has_bank_brand_signal(msg, body)
+    if body is None:
+        body = get_body(msg)
+    return (
+        has_bank_sender_claim_mismatch_signal(msg, body)
+        or has_brand_spoofing_signal(msg, body)
+        or has_link_text_href_mismatch_signal(body)
+    )
+
+
+def parse_spamassassin_score(output):
+    """Extrahiert Score und Schwelle aus spamc oder spamassassin Ausgabe."""
+    match = re.search(r"(?<![\w.-])(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)(?![\w.-])", output)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+
+    match = re.search(
+        r"\bscore=(-?\d+(?:\.\d+)?)\s+required=(-?\d+(?:\.\d+)?)\b",
+        output,
+        re.IGNORECASE,
+    )
+    if match:
+        return float(match.group(1)), float(match.group(2))
+
+    match = re.search(
+        r"\((-?\d+(?:\.\d+)?)\s+points,\s+(-?\d+(?:\.\d+)?)\s+required\)",
+        output,
+        re.IGNORECASE,
+    )
+    if match:
+        return float(match.group(1)), float(match.group(2))
+
+    return None
+
+
+def build_spamassassin_result(output, truncated, scanner_name):
+    parsed = parse_spamassassin_score(output)
+    if not parsed:
+        log.warning(f"{scanner_name} Antwort nicht parsebar: {output[:200]}")
+        return None
+
+    score, threshold = parsed
+    if threshold <= 0:
+        log.warning(f"{scanner_name} lieferte unbrauchbaren Schwellwert: {output[:200]}")
+        return None
+
+    return {
+        "score": score,
+        "threshold": threshold,
+        "truncated": truncated,
+    }
+
+
+def check_spamassassin_fallback(scan_bytes, truncated, timeout, config):
+    spamassassin_bin = get_spamassassin_binary(config)
+    if not spamassassin_bin:
+        return None
+
+    try:
+        result = subprocess.run(
+            [spamassassin_bin, "-t"],
+            input=scan_bytes,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning(f"SpamAssassin Fallback Timeout nach {timeout}s")
+        return None
+    except Exception as e:
+        log.warning(f"SpamAssassin Fallback Fehler: {e}")
+        return None
+
+    output = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        log.warning(f"spamassassin Fallback Fehler (exit {result.returncode}): {(stderr or output)[:200]}")
+        return None
+
+    return build_spamassassin_result(output, truncated, "spamassassin")
+
+
+def check_spamassassin(raw_email, config):
+    """Fragt SpamAssassin über spamc ab und gibt Score/Schwellwert zurück."""
+    if not is_spamassassin_configured(config):
+        return None
+
+    spamc_bin = get_spamc_binary(config)
+    timeout = config.getint("spamassassin", "timeout", fallback=DEFAULT_SPAMASSASSIN_TIMEOUT)
+    max_bytes = config.getint("spamassassin", "max_bytes", fallback=DEFAULT_SPAMASSASSIN_MAX_BYTES)
+    scan_bytes = raw_email[:max_bytes] if max_bytes > 0 else raw_email
+    truncated = max_bytes > 0 and len(raw_email) > max_bytes
+    spamc_max_size = max_bytes if max_bytes > 0 else len(scan_bytes)
+    spamc_args = [spamc_bin, "-x", "-c"]
+    if spamc_max_size > 0:
+        spamc_args.extend(["-s", str(min(spamc_max_size, 268435456))])
+
+    if spamc_bin:
+        try:
+            result = subprocess.run(
+                spamc_args,
+                input=scan_bytes,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning(f"SpamAssassin Timeout nach {timeout}s")
+        except Exception as e:
+            log.warning(f"SpamAssassin Fehler: {e}")
+        else:
+            output = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+            if result.returncode in (0, 1):
+                spamc_result = build_spamassassin_result(output, truncated, "spamc")
+                if spamc_result:
+                    return spamc_result
+            else:
+                stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+                log.warning(f"spamc Fehler (exit {result.returncode}): {(stderr or output)[:200]}")
+
+    return check_spamassassin_fallback(scan_bytes, truncated, timeout, config)
+
+
+def format_spamassassin_detail(spam_result):
+    if not spam_result:
+        return ""
+    suffix = ",truncated" if spam_result.get("truncated") else ""
+    return f"spamassassin={spam_result['score']:.1f}/{spam_result['threshold']:.1f}{suffix}"
+
+
+def is_spamassassin_spam(spam_result, threshold_spam):
+    return bool(spam_result and spam_result["score"] >= threshold_spam)
 
 
 def _get_legit_domains(brand):
@@ -387,11 +1184,13 @@ def calculate_score(msg):
         ("auth_results", check_auth_results(msg)),
         ("from_reply_mismatch", check_from_reply_mismatch(msg)),
         ("suspicious_urls", check_urls(body)),
+        ("link_text_href_mismatch", get_link_text_href_mismatch_score(body)),
         ("urgency_keywords", check_urgency_keywords(body, subject)),
         ("html_forms", check_html_forms(body)),
         ("suspicious_attachments", check_attachments(msg)),
         ("encoding_tricks", check_encoding_tricks(msg)),
         ("domain_spoofing", check_from_domain_spoofing(msg)),
+        ("brand_spoofing", get_brand_spoofing_score(msg, body)),
         ("bank_brand_mismatch", check_bank_brand_mismatch(msg, body)),
     ]
 
@@ -491,14 +1290,19 @@ def ensure_fish_folder(imap_conn, folder_name):
     log.info(f"Ordner '{folder_name}' erstellt")
 
 
-def move_to_fish(imap_conn, uid, folder_fish):
-    """Verschiebt eine Mail in den Fish-Ordner."""
-    result = imap_conn.uid("COPY", uid, folder_fish)
+def move_to_folder(imap_conn, uid, folder_name):
+    """Verschiebt eine Mail in den angegebenen IMAP-Ordner."""
+    result = imap_conn.uid("COPY", uid, folder_name)
     if result[0] == "OK":
         imap_conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
         imap_conn.expunge()
         return True
     return False
+
+
+def move_to_fish(imap_conn, uid, folder_fish):
+    """Verschiebt eine Mail in den Fish-Ordner."""
+    return move_to_folder(imap_conn, uid, folder_fish)
 
 
 def process_mailbox(config):
@@ -509,14 +1313,19 @@ def process_mailbox(config):
     password = config.get("imap", "password")
     folder_inbox = config.get("imap", "folder_inbox")
     folder_fish = config.get("imap", "folder_fish")
+    folder_spam = config.get("imap", "folder_spam", fallback=DEFAULT_SPAM_FOLDER)
     threshold_auto = config.getint("thresholds", "auto_fish")
     threshold_claude = config.getint("thresholds", "claude_check")
+    threshold_spam = config.getfloat("thresholds", "spamassassin_spam", fallback=DEFAULT_SPAMASSASSIN_THRESHOLD)
+    spamassassin_enabled = is_spamassassin_configured(config)
 
     conn = imaplib.IMAP4_SSL(server, port)
     conn.login(user, password)
     log.info(f"IMAP Login erfolgreich: {user}@{server}")
 
     ensure_fish_folder(conn, folder_fish)
+    if spamassassin_enabled and folder_spam != folder_fish:
+        ensure_fish_folder(conn, folder_spam)
     conn.select(folder_inbox)
 
     last_uid = get_last_uid()
@@ -539,7 +1348,8 @@ def process_mailbox(config):
 
     log.info(f"{len(uids)} neue Mail(s) gefunden")
 
-    moved = 0
+    moved_fish = 0
+    moved_spam = 0
     for uid in uids:
         # Read the full message without setting \Seen so FreeScout can still import it.
         status, msg_data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
@@ -553,41 +1363,75 @@ def process_mailbox(config):
         body = get_body(msg)
 
         score, details = calculate_score(msg)
-        detail_str = ", ".join(details) if details else "none"
+        spam_result = check_spamassassin(raw_email, config)
+        spam_detail = format_spamassassin_detail(spam_result)
+        detail_parts = details[:]
+        if spam_detail:
+            detail_parts.append(spam_detail)
+        detail_str = ", ".join(detail_parts) if detail_parts else "none"
         log.info(f"Mail: '{subject}' von {from_addr} — Score: {score} ({detail_str})")
 
         needs_claude = requires_claude_review(msg, body)
+        is_spam = is_spamassassin_spam(spam_result, threshold_spam)
 
         if needs_claude:
-            log.info("  → Bank-/Finanzmarke erkannt, frage Claude unabhängig vom Score...")
+            log.info("  → Marken-/Finanzsignal erkannt, frage Claude unabhängig vom Score...")
             claude_result = ask_claude(msg, config)
             if claude_result is True:
                 log.info(f"  → Claude: PHISHING, verschiebe nach {folder_fish}")
                 if move_to_fish(conn, uid, folder_fish):
-                    moved += 1
+                    moved_fish += 1
             elif claude_result is False:
-                log.info("  → Claude: SAFE, belasse in INBOX ohne Flags zu ändern")
+                if is_spam:
+                    log.info(f"  → Claude: SAFE, aber SpamAssassin {spam_result['score']:.1f} >= {threshold_spam:.1f}; verschiebe nach {folder_spam}")
+                    if move_to_folder(conn, uid, folder_spam):
+                        moved_spam += 1
+                else:
+                    log.info("  → Claude: SAFE, belasse in INBOX ohne Flags zu ändern")
             else:
-                log.warning("  → Claude ohne eindeutige Entscheidung, belasse in INBOX ohne Flags zu ändern")
+                if score >= threshold_auto:
+                    log.warning(f"  → Claude ohne eindeutige Entscheidung, aber Score {score} >= {threshold_auto}; verschiebe nach {folder_fish}")
+                    if move_to_fish(conn, uid, folder_fish):
+                        moved_fish += 1
+                elif is_spam:
+                    log.warning(f"  → Claude ohne eindeutige Entscheidung, aber SpamAssassin {spam_result['score']:.1f} >= {threshold_spam:.1f}; verschiebe nach {folder_spam}")
+                    if move_to_folder(conn, uid, folder_spam):
+                        moved_spam += 1
+                else:
+                    log.warning("  → Claude ohne eindeutige Entscheidung, belasse in INBOX ohne Flags zu ändern")
         elif score >= threshold_auto:
             log.info(f"  → PHISHING (Score {score} >= {threshold_auto}), verschiebe nach {folder_fish}")
             if move_to_fish(conn, uid, folder_fish):
-                moved += 1
+                moved_fish += 1
         elif score >= threshold_claude:
             log.info(f"  → Score {score}, frage Claude...")
             claude_result = ask_claude(msg, config)
             if claude_result is True:
                 log.info(f"  → Claude: PHISHING, verschiebe nach {folder_fish}")
                 if move_to_fish(conn, uid, folder_fish):
-                    moved += 1
+                    moved_fish += 1
             elif claude_result is False:
-                log.info("  → Claude: SAFE, belasse in INBOX ungelesen fuer FreeScout")
+                if is_spam:
+                    log.info(f"  → Claude: SAFE, aber SpamAssassin {spam_result['score']:.1f} >= {threshold_spam:.1f}; verschiebe nach {folder_spam}")
+                    if move_to_folder(conn, uid, folder_spam):
+                        moved_spam += 1
+                else:
+                    log.info("  → Claude: SAFE, belasse in INBOX ungelesen fuer FreeScout")
             else:
-                log.warning("  → Claude ohne eindeutige Entscheidung, belasse in INBOX ohne Flags zu ändern")
+                if is_spam:
+                    log.warning(f"  → Claude ohne eindeutige Entscheidung, aber SpamAssassin {spam_result['score']:.1f} >= {threshold_spam:.1f}; verschiebe nach {folder_spam}")
+                    if move_to_folder(conn, uid, folder_spam):
+                        moved_spam += 1
+                else:
+                    log.warning("  → Claude ohne eindeutige Entscheidung, belasse in INBOX ohne Flags zu ändern")
+        elif is_spam:
+            log.info(f"  → SPAM (SpamAssassin {spam_result['score']:.1f} >= {threshold_spam:.1f}), verschiebe nach {folder_spam}")
+            if move_to_folder(conn, uid, folder_spam):
+                moved_spam += 1
         else:
             log.info(f"  → SAFE (Score {score} < {threshold_claude}), belasse in INBOX ungelesen fuer FreeScout")
 
-    log.info(f"Fertig. {moved} Mail(s) nach {folder_fish} verschoben")
+    log.info(f"Fertig. {moved_fish} Mail(s) nach {folder_fish}, {moved_spam} Mail(s) nach {folder_spam} verschoben")
 
     if uids:
         max_uid = int(max(uids))

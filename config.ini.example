@@ -5,10 +5,20 @@ user = your_imap_user
 password = your_imap_password
 folder_inbox = INBOX
 folder_fish = Fish
+folder_spam = Spam
 
 [thresholds]
 auto_fish = 70
-kimi_check = 30
+claude_check = 30
+spamassassin_spam = 8.0
 
-[kimi]
-binary = /root/.local/bin/kimi
+[claude]
+binary = /root/.local/bin/claude
+model = sonnet
+
+[spamassassin]
+enabled = false
+spamc_binary = /usr/bin/spamc
+spamassassin_binary = /usr/bin/spamassassin
+timeout = 20
+max_bytes = 750000
