@@ -13,6 +13,7 @@ import configparser
 import subprocess
 import shutil
 import html
+import time
 import unicodedata
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlparse
@@ -23,6 +24,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.i
 LOCK_FILE = "/tmp/fishcatcher.lock"
 LOG_FILE = "/var/log/fishcatcher.log"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_uid")
+UIDVALIDITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".uidvalidity")
 DEFAULT_SPAM_FOLDER = "Spam"
 DEFAULT_SPAMASSASSIN_THRESHOLD = 8.0
 DEFAULT_SPAMASSASSIN_TIMEOUT = 20
@@ -53,6 +55,10 @@ URGENCY_KEYWORDS = [
     r"dienste.*gesperrt", r"service.*suspend", r"service.*gesperrt",
     r"zugang.*gesperrt", r"login.*erforderlich",
     r"steuererstattung", r"tax.*refund",
+    r"abgleich.*erforderlich", r"aktion.*erforderlich", r"handlung.*erforderlich",
+    r"freigabe.*erforderlich", r"verifizierung.*(?:offen|nötig|noetig|erforderlich)",
+    r"bestätigung.*(?:offen|nötig|noetig)", r"profil.*eingeschränkt",
+    r"steuer.*(?:übermittlung|uebermittlung|erklärung|erklaerung).*(?:notwendig|erforderlich)",
     r"gewonnen", r"you.*won", r"prize",
     r"lotterie", r"lottery",
 ]
@@ -63,7 +69,7 @@ SUSPICIOUS_EXTENSIONS = {".exe", ".scr", ".js", ".vbs", ".bat", ".cmd", ".pif", 
 # --- URL-Shortener Domains ---
 URL_SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "buff.ly", "ow.ly", "rebrand.ly", "cutt.ly"}
 
-URL_PATTERN = re.compile(r'https?://[^\s<>"\']+', re.I)
+URL_PATTERN = re.compile(r'https?://[^\s<>"\'\[\]]+', re.I)
 DOMAIN_TEXT_PATTERN = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b", re.I)
 LINK_REWRITE_TARGET_PARAMS = {
     "safelinks.protection.outlook.com": ("url",),
@@ -78,7 +84,37 @@ SUSPICIOUS_TLDS = {
     "shop", "xyz", "top", "club", "info", "online", "site", "website",
     "buzz", "click", "link", "win", "bid", "loan", "racing", "review",
     "stream", "gq", "cf", "tk", "ml", "ga", "icu", "rest", "monster",
+    "live", "cfd", "sbs", "cyou", "lol", "quest", "bond", "zip", "mov", "pw",
 }
+
+# Freemail-Anbieter: Absender dort sind Privatpersonen. Ein Anzeigename wie
+# "Service", "Verwaltung" oder "ELSTER Info" von Freemail ist ein Phishing-Signal.
+FREEMAIL_DOMAINS = {
+    "gmx.de", "gmx.net", "gmx.com", "gmx.at", "gmx.ch", "gmx.us", "gmx.co.uk",
+    "web.de", "t-online.de", "gmail.com", "googlemail.com", "hotmail.com", "hotmail.de",
+    "outlook.com", "outlook.de", "live.com", "live.de", "yahoo.com", "yahoo.de",
+    "icloud.com", "me.com", "aol.com", "aol.de", "mail.de", "posteo.de", "proton.me",
+    "protonmail.com", "mail.com", "email.com", "usa.com", "europe.com", "post.com",
+    "consultant.com", "engineer.com", "dr.com", "myself.com",
+    # Zoho-Sammelabsender ohne eigene Domain ("Abrechnungsservice", "1Blu.de" Fakes)
+    "zohosubscriptions.com", "zoho.com", "zoho.eu", "zohomail.com", "zohomail.eu",
+}
+# Freemail-Domains, die im deutschen Alltag praktisch nie vorkommen, aber in
+# jeder beobachteten Phishing-Welle (gmx.us, mail.com-Familie).
+EXOTIC_FREEMAIL_DOMAINS = {
+    "gmx.us", "gmx.co.uk", "mail.com", "email.com", "usa.com", "europe.com",
+    "post.com", "consultant.com", "engineer.com", "dr.com", "myself.com",
+}
+# Wortende statt Wortgrenze: deutsche Komposita wie "Erstattungshinweis" oder
+# "Kundenservice" muessen treffen.
+INSTITUTIONAL_DISPLAY_PATTERN = re.compile(
+    r"\b\w*(?:service|support|kundenservice|kundendienst|info|team|verwaltung|sachbearbeitung|"
+    r"sachbearbeiter|filiale|zentrale|buchhaltung|rechnung|zahlung|hinweis|mitteilung|"
+    r"benachrichtigung|sicherheit|security|ticket|beratung|kontakt|bank|sparkasse|elster|"
+    r"finanzamt|steuer|zoll|behörde|behoerde|polizei|inkasso|mahnung|kundenkonto|"
+    r"no-?reply|noreply|administrator|admin|it-abteilung|helpdesk)\b",
+    re.I,
+)
 
 LEGIT_BUSINESS_TLDS = {"de", "com", "net", "org", "eu", "at", "ch"}
 COMMON_VISIBLE_DOMAIN_TLDS = LEGIT_BUSINESS_TLDS | SUSPICIOUS_TLDS | {
@@ -360,6 +396,30 @@ BRAND_SPOOFING_RULES = [
         "body_context": "account",
     },
     {
+        "name": "ELSTER",
+        "patterns": [r"\belster\b", r"\bfinanzamt\b", r"\bbundeszentralamt\b", r"\bsteuererstattung\b"],
+        "domains": {"elster.de", "bzst.de", "bundesfinanzministerium.de", "finanzverwaltung.nrw.de"},
+        "body_context": "payment",
+    },
+    {
+        "name": "Doctolib",
+        "patterns": [r"\bdoctolib\b"],
+        "domains": {"doctolib.de", "doctolib.com", "doctolib.fr"},
+        "body_context": "account",
+    },
+    {
+        "name": "Netflix",
+        "patterns": [r"\bnetflix\b"],
+        "domains": {"netflix.com"},
+        "body_context": "account",
+    },
+    {
+        "name": "ADAC",
+        "patterns": [r"\badac\b"],
+        "domains": {"adac.de"},
+        "body_context": "delivery",
+    },
+    {
         "name": "Mercedes-Benz",
         "patterns": [r"\bmercedes(?:\s|-)*benz\b", r"\bmercedes\b"],
         "domains": {"mercedes-benz.de", "mercedes-benz.com", "mercedes.me"},
@@ -382,6 +442,7 @@ BRAND_BODY_CONTEXT_PATTERNS = {
     "payment": [
         r"\brechnung\b", r"\bzahlung\b", r"\bbezahlen\b", r"\bfällig\b",
         r"\bfaellig\b", r"\bmahnung\b", r"\bbetrag\b", r"\bkarte\b",
+        r"\berstattung\b", r"\bübermittlung\b", r"\buebermittlung\b", r"\bsteuer",
     ],
     "delivery": [
         r"\bpaket\b", r"\bsendung\b", r"\bliefer", r"\bzoll\b",
@@ -525,16 +586,25 @@ def extract_html_links(body):
     return parser.links
 
 
+def safe_urlparse(value):
+    """urlparse ohne ValueError: kaputte URLs (z.B. 'http://x.de]' → 'Invalid IPv6 URL')
+    duerfen nie den ganzen Lauf abbrechen."""
+    try:
+        return urlparse(value)
+    except ValueError:
+        return urlparse("")
+
+
 def get_url_domain(value):
     value = html.unescape(value or "").strip().strip("<>\"'")
     value = value.rstrip(").,;:!?]}")
     if not value:
         return ""
-    parsed = urlparse(value)
+    parsed = safe_urlparse(value)
     if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
         return ""
     if not parsed.netloc and not parsed.scheme:
-        parsed = urlparse("https://" + value)
+        parsed = safe_urlparse("https://" + value)
     return normalize_domain(parsed.hostname or "")
 
 
@@ -559,7 +629,7 @@ def extract_rewritten_href_domains(href):
 
 def extract_rewritten_href_urls(href):
     href = html.unescape(href or "").strip()
-    parsed = urlparse(href)
+    parsed = safe_urlparse(href)
     href_domain = normalize_domain(parsed.hostname or "")
     target_params = get_link_rewrite_target_params(href_domain)
     if not target_params:
@@ -766,14 +836,52 @@ def check_attachments(msg):
     return 0
 
 
+INVISIBLE_CHAR_PATTERN = re.compile(r"[\u00ad\u200b-\u200f\u2060-\u2064\u206a-\u206f\ufeff\u180e]")
+# Latein und Kyrillisch/Griechisch im selben Wort = Homoglyphen-Trick (z.B. "Spаrkasse").
+MIXED_SCRIPT_WORD_PATTERN = re.compile(
+    r"(?:[A-Za-z][\u0370-\u03FF\u0400-\u052F]|[\u0370-\u03FF\u0400-\u052F][A-Za-z])"
+)
+
+
+def has_invisible_chars(text):
+    return bool(INVISIBLE_CHAR_PATTERN.search(html.unescape(text or "")))
+
+
 def check_encoding_tricks(msg):
-    """Prüft auf Encoding-Tricks im Absender."""
-    from_header = msg.get("From", "")
-    display_name = parseaddr(from_header)[0]
-    if display_name:
-        if re.search(r'[\u0400-\u04FF\u0500-\u052F]', display_name):
-            return 10
+    """Prüft auf Encoding-Tricks in Absendername und Betreff.
+
+    Unsichtbare Zeichen (Zero-Width, Soft-Hyphen, BOM) in Anzeigename oder
+    Betreff kommen in normaler Post nicht vor; in der Praxis waren 31/31 solcher
+    Mails Phishing (apoBank-/Volksbank-/ELSTER-Welle 2026). Rein kyrillische
+    Namen sind dagegen normale Patienten und zaehlen nicht.
+    """
+    from_header = decode_mime_header(msg.get("From", ""))
+    subject = decode_mime_header(msg.get("Subject", ""))
+    display_name = parseaddr(from_header)[0] or from_header
+    if has_invisible_chars(display_name) or has_invisible_chars(subject):
+        return 45
+    if MIXED_SCRIPT_WORD_PATTERN.search(display_name) or MIXED_SCRIPT_WORD_PATTERN.search(subject):
+        return 30
     return 0
+
+
+def has_encoding_trick_signal(msg):
+    return check_encoding_tricks(msg) >= 30
+
+
+def check_freemail_institution(msg):
+    """Freemail-Absender mit Institutions-Anzeigename ("Service", "Verwaltung", "ELSTER Info")."""
+    from_domain = get_from_domain(msg)
+    if not domain_matches(from_domain, FREEMAIL_DOMAINS):
+        return 0
+    score = 0
+    display_name = parseaddr(decode_mime_header(msg.get("From", "")))[0]
+    display_text = normalize_match_text(display_name)
+    if display_text and "@" not in display_text and INSTITUTIONAL_DISPLAY_PATTERN.search(display_text):
+        score += 25
+    if domain_matches(from_domain, EXOTIC_FREEMAIL_DOMAINS):
+        score += 15
+    return score
 
 
 def check_from_domain_spoofing(msg):
@@ -1035,6 +1143,7 @@ def requires_claude_review(msg, body=None):
         has_bank_sender_claim_mismatch_signal(msg, body)
         or has_brand_spoofing_signal(msg, body)
         or has_link_text_href_mismatch_signal(body)
+        or has_encoding_trick_signal(msg)
     )
 
 
@@ -1189,6 +1298,7 @@ def calculate_score(msg):
         ("html_forms", check_html_forms(body)),
         ("suspicious_attachments", check_attachments(msg)),
         ("encoding_tricks", check_encoding_tricks(msg)),
+        ("freemail_institution", check_freemail_institution(msg)),
         ("domain_spoofing", check_from_domain_spoofing(msg)),
         ("brand_spoofing", get_brand_spoofing_score(msg, body)),
         ("bank_brand_mismatch", check_bank_brand_mismatch(msg, body)),
@@ -1203,7 +1313,7 @@ def calculate_score(msg):
     return min(total, 100), details
 
 
-def ask_claude(msg, config):
+def ask_claude(msg, config, details=None):
     """Fragt Claude ob eine E-Mail Phishing ist."""
     claude_bin = config.get("claude", "binary", fallback="/root/.local/bin/claude")
     claude_model = config.get("claude", "model", fallback="sonnet")
@@ -1222,7 +1332,12 @@ def ask_claude(msg, config):
         f"- Kleine Firmen haben oft kein DKIM/DMARC → dkim=none/dmarc=none ist KEIN Phishing-Indikator\n"
         f"- Sekretärinnen schreiben oft im Namen anderer → Absender ≠ Signatur ist normal\n"
         f"- Anhang-Erwähnungen ohne Anhang können bedeuten, dass der Anhang als Bild/PDF inline ist\n"
-        f"- Teams/Zoom-Links, HubSpot-Signaturen, Google-CDN-Bilder sind normal\n\n"
+        f"- Teams/Zoom-Links, HubSpot-Signaturen, Google-CDN-Bilder sind normal\n"
+        f"- Patienten schreiben von Freemail-Adressen (gmx, gmail, t-online), oft mit kyrillischen Namen → normal\n"
+        f"- Banken, Behörden (ELSTER, Finanzamt), Paketdienste oder Hoster schreiben NIE von Freemail-Adressen\n"
+        f"- Unsichtbare Zeichen (Zero-Width, Soft-Hyphen) in Absendername/Betreff sind ein sicheres Phishing-Zeichen\n"
+        f"- Aufforderungen zu Verifizierung/Freigabe/Datenabgleich mit Link sind klassisches Credential-Phishing\n\n"
+        f"Heuristik-Signale des Vorfilters: {', '.join(details) if details else 'keine'}\n"
         f"Von: {from_addr}\n"
         f"Reply-To: {reply_to or '(nicht gesetzt)'}\n"
         f"Betreff: {subject}\n"
@@ -1278,6 +1393,34 @@ def save_last_uid(uid):
         log.warning(f"Konnte State-Datei nicht schreiben: {e}")
 
 
+def check_uidvalidity(conn, last_uid):
+    """Setzt den UID-Zeiger neu, wenn der Server die UIDs neu vergeben hat.
+
+    Sonst wuerde ein alter last_uid entweder alles erneut pruefen (tausende
+    Mails) oder, wenn er groesser als alle neuen UIDs ist, nie wieder etwas.
+    """
+    status, data = conn.response("UIDVALIDITY")
+    current = (data[0] or b"").decode() if data and data[0] else ""
+    if not current:
+        return last_uid
+    stored = ""
+    if os.path.exists(UIDVALIDITY_FILE):
+        with open(UIDVALIDITY_FILE) as f:
+            stored = f.read().strip()
+    if stored and stored != current:
+        status, search = conn.uid("SEARCH", None, "ALL")
+        uids = search[0].split() if status == "OK" and search[0] else []
+        new_last = max((int(u) for u in uids), default=0)
+        log.warning(f"UIDVALIDITY geaendert ({stored} -> {current}); setze last_uid {last_uid} -> {new_last}, Backlog wird uebersprungen")
+        notify_failure(RuntimeError(f"UIDVALIDITY geaendert ({stored} -> {current}), Backlog bis UID {new_last} uebersprungen"))
+        save_last_uid(new_last)
+        last_uid = new_last
+    if stored != current:
+        with open(UIDVALIDITY_FILE, "w") as f:
+            f.write(current)
+    return last_uid
+
+
 def ensure_fish_folder(imap_conn, folder_name):
     """Erstellt den Fish-Ordner falls nicht vorhanden."""
     status, folders = imap_conn.list()
@@ -1327,8 +1470,7 @@ def process_mailbox(config):
     if spamassassin_enabled and folder_spam != folder_fish:
         ensure_fish_folder(conn, folder_spam)
     conn.select(folder_inbox)
-
-    last_uid = get_last_uid()
+    last_uid = check_uidvalidity(conn, get_last_uid())
     # Scan by UID, not by UNSEEN. BODY.PEEK below preserves unread flags for FreeScout,
     # while already-read-but-new messages are still reviewed.
     search_query = f"UID {last_uid+1}:*" if last_uid > 0 else "ALL"
@@ -1360,9 +1502,14 @@ def process_mailbox(config):
         msg = email.message_from_bytes(raw_email)
         subject = decode_mime_header(msg.get("Subject", ""))
         from_addr = msg.get("From", "")
-        body = get_body(msg)
-
-        score, details = calculate_score(msg)
+        try:
+            body = get_body(msg)
+            score, details = calculate_score(msg)
+        except Exception as e:
+            # Eine einzelne kaputte Mail darf den Lauf nicht stoppen: so blieb der
+            # Filter vom 26.05. bis 16.10.2026 an UID 10081 haengen (0 Mails geprueft).
+            log.error(f"Mail UID {uid.decode()} '{subject}' von {from_addr}: Scoring fehlgeschlagen, bleibt in INBOX: {e}", exc_info=True)
+            continue
         spam_result = check_spamassassin(raw_email, config)
         spam_detail = format_spamassassin_detail(spam_result)
         detail_parts = details[:]
@@ -1376,7 +1523,7 @@ def process_mailbox(config):
 
         if needs_claude:
             log.info("  → Marken-/Finanzsignal erkannt, frage Claude unabhängig vom Score...")
-            claude_result = ask_claude(msg, config)
+            claude_result = ask_claude(msg, config, details)
             if claude_result is True:
                 log.info(f"  → Claude: PHISHING, verschiebe nach {folder_fish}")
                 if move_to_fish(conn, uid, folder_fish):
@@ -1405,7 +1552,7 @@ def process_mailbox(config):
                 moved_fish += 1
         elif score >= threshold_claude:
             log.info(f"  → Score {score}, frage Claude...")
-            claude_result = ask_claude(msg, config)
+            claude_result = ask_claude(msg, config, details)
             if claude_result is True:
                 log.info(f"  → Claude: PHISHING, verschiebe nach {folder_fish}")
                 if move_to_fish(conn, uid, folder_fish):
@@ -1440,6 +1587,25 @@ def process_mailbox(config):
     conn.logout()
 
 
+ALERT_MARKER = "/tmp/fishcatcher.alerted"
+ALERT_INTERVAL_SECONDS = 6 * 3600
+
+
+def notify_failure(error):
+    """Telegram-Alarm bei Lauf-Abbruch, gedrosselt auf einmal pro 6 h."""
+    try:
+        if os.path.exists(ALERT_MARKER) and time.time() - os.path.getmtime(ALERT_MARKER) < ALERT_INTERVAL_SECONDS:
+            return
+        open(ALERT_MARKER, "w").close()
+        subprocess.run(
+            ["/usr/local/bin/send-telegram-alert.sh", "Fishcatcher abgebrochen",
+             f"{type(error).__name__}: {str(error)[:300]}\nSiehe {LOG_FILE}"],
+            timeout=30, capture_output=True,
+        )
+    except Exception as alert_error:
+        log.warning(f"Telegram-Alarm fehlgeschlagen: {alert_error}")
+
+
 def main():
     lock_fd = open(LOCK_FILE, "w")
     try:
@@ -1453,6 +1619,7 @@ def main():
         process_mailbox(config)
     except Exception as e:
         log.error(f"Fehler: {e}", exc_info=True)
+        notify_failure(e)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()

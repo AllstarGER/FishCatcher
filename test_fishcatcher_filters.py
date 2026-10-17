@@ -219,6 +219,58 @@ class FishcatcherFilterTests(unittest.TestCase):
             (1003.7, 5.0),
         )
 
+    def test_broken_url_with_trailing_bracket_does_not_raise(self):
+        # Regression: 'http://www.elektrosysteme.de]' warf ValueError('Invalid IPv6 URL')
+        # und stoppte den gesamten Lauf ab UID 10081 (26.05.–16.10.2026).
+        body = "Signatur: <http://www.elektrosysteme.de]> und https://david.tobit.software]"
+        self.assertEqual(fc.get_url_domain("http://www.elektrosysteme.de]"), "www.elektrosysteme.de")
+        self.assertEqual(fc.check_urls(body), 0)
+        self.assertEqual(fc.get_link_text_href_mismatch_score('<a href="http://x.de]">http://y.de]</a>'), 35)
+        msg = make_msg("Kunde <k@elektrosysteme.de>", "AUTOREPLY Re: Terminvorschlag", body)
+        score, _ = fc.calculate_score(msg)
+        self.assertEqual(score, 0)
+
+    def test_invisible_chars_in_display_name_or_subject_are_strong_signal(self):
+        msg = make_msg("ap\u200foBan\u200fk\ufeff <stewart@gmx.us>", "[Aktion erforderlich] Fall 1587-74", "Bitte Daten abgleichen.")
+        self.assertEqual(fc.check_encoding_tricks(msg), 45)
+        self.assertTrue(fc.requires_claude_review(msg))
+        msg = make_msg("Max Mustermann <max@example.de>", "Ihre Eink\u200fommensteu\u200fer", "Hallo")
+        self.assertEqual(fc.check_encoding_tricks(msg), 45)
+        # Soft-Hyphen zaehlt ebenfalls
+        msg = make_msg("Spar\u00adkasse <x@example.de>", "Hallo", "Hallo")
+        self.assertEqual(fc.check_encoding_tricks(msg), 45)
+
+    def test_cyrillic_patient_names_are_not_penalized(self):
+        msg = make_msg("=?UTF-8?B?0JvRjtC00LzQuNC70LA=?= <ludmila@gmail.com>", "Anfrage Untersuchung Klasse C", "Guten Tag, ich brauche einen Termin.")
+        self.assertEqual(fc.check_encoding_tricks(msg), 0)
+        self.assertEqual(fc.check_freemail_institution(msg), 0)
+        score, _ = fc.calculate_score(msg)
+        self.assertLess(score, 30)
+
+    def test_mixed_script_homoglyph_is_flagged(self):
+        msg = make_msg("Sp\u0430rkasse <x@example.de>", "Hallo", "Hallo")  # kyrillisches а
+        self.assertEqual(fc.check_encoding_tricks(msg), 30)
+
+    def test_freemail_with_institutional_display_name(self):
+        msg = make_msg("ELSTER Info <jose8397@mail.com>", "Hallo", "Hallo")
+        self.assertEqual(fc.check_freemail_institution(msg), 40)  # 25 Institution + 15 exotische Freemail
+        msg = make_msg("Erstattungshinweis <fermina@gmail.com>", "Hallo", "Hallo")
+        self.assertEqual(fc.check_freemail_institution(msg), 25)
+        msg = make_msg("Dr. med. Georg Voos <dr.georg.voos@gmx.de>", "Hallo", "Hallo")
+        self.assertEqual(fc.check_freemail_institution(msg), 0)
+        msg = make_msg("Service Team <service@firma.de>", "Hallo", "Hallo")
+        self.assertEqual(fc.check_freemail_institution(msg), 0)
+
+    def test_elster_phishing_reaches_claude_threshold(self):
+        msg = make_msg(
+            "=?UTF-8?Q?ELS=E2=80=8FTE=E2=80=8FR=EF=BB=BF_=E2=80=A2_Info?= <jose8397@mail.com>",
+            "Ihre Eink\u200fommensteu\u200fer Überm\u200fittlung notwendig",
+            "Ihre Steuererklärung: Übermittlung erforderlich. https://bit.ly/x",
+        )
+        score, details = fc.calculate_score(msg)
+        self.assertGreaterEqual(score, 70, details)
+        self.assertTrue(fc.requires_claude_review(msg))
+
 
 if __name__ == "__main__":
     unittest.main()
